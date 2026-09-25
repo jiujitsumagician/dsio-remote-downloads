@@ -56,6 +56,9 @@ install_cloudflared(){
 
 enable_screen_sharing(){
   local pw="$1"
+  # VNC (RFB) auth is DES over the first 8 password bytes; cap here so the Mac and the Hub's
+  # viewer always agree on exactly those 8 chars even if a longer password is issued.
+  pw="${pw:0:8}"
   log "Enabling Screen Sharing (VNC) on loopback..."
   # Enable Apple Remote Desktop / Screen Sharing agent with full access.
   /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
