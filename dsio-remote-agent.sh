@@ -52,14 +52,36 @@ install_cloudflared(){
   chmod +x "$BIN"
 }
 
+# The display server dictates the VNC server: X11 -> x11vnc; Wayland -> wayvnc (wlroots) or,
+# on GNOME/KDE Wayland, the compositor's own built-in sharing (we detect and guide).
+SESSION_TYPE=""
+detect_session(){
+  SESSION_TYPE="${XDG_SESSION_TYPE:-}"
+  if [ -z "$SESSION_TYPE" ]; then
+    local u; u="$(logname 2>/dev/null || stat -c '%U' "/proc/$(pgrep -n gnome-shell 2>/dev/null || echo 1)" 2>/dev/null)"
+    SESSION_TYPE="$(loginctl show-session "$(loginctl 2>/dev/null | awk 'NR==2{print $1}')" -p Type --value 2>/dev/null)"
+  fi
+  [ -z "$SESSION_TYPE" ] && SESSION_TYPE="x11"
+  log "Display session type: $SESSION_TYPE"
+}
+pkg_install(){
+  if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then yum install -y "$@"
+  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm "$@"
+  else die "No supported package manager (apt/dnf/yum/pacman)."; fi
+}
 install_vnc(){
-  if command -v x11vnc >/dev/null 2>&1; then log "x11vnc present"; return; fi
-  log "Installing x11vnc..."
-  if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq x11vnc
-  elif command -v dnf >/dev/null 2>&1; then dnf install -y x11vnc
-  elif command -v yum >/dev/null 2>&1; then yum install -y x11vnc
-  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm x11vnc
-  else die "No supported package manager (apt/dnf/yum/pacman) to install x11vnc."; fi
+  detect_session
+  if [ "$SESSION_TYPE" = "wayland" ]; then
+    if command -v wayvnc >/dev/null 2>&1; then log "wayvnc present"; return; fi
+    log "Wayland detected — installing wayvnc (works on wlroots compositors: sway, etc.)..."
+    pkg_install wayvnc || log "WARN: wayvnc not available. On GNOME/KDE Wayland enable the built-in screen share (gnome-remote-desktop / krfb) instead."
+  else
+    if command -v x11vnc >/dev/null 2>&1; then log "x11vnc present"; return; fi
+    log "Installing x11vnc..."
+    pkg_install x11vnc
+  fi
 }
 
 # Enroll with the Hub: announce, then poll for the operator-approved config.
@@ -118,8 +140,11 @@ ingress:
   - service: http_status:404
 YML
   # VNC password (loopback-only server, only reachable through the tunnel)
-  x11vnc -storepasswd "$vncpw" "$DIR/vncpass" >/dev/null 2>&1
-  chmod 600 "$DIR/vncpass"
+  if [ "$SESSION_TYPE" != "wayland" ] && command -v x11vnc >/dev/null 2>&1; then
+    x11vnc -storepasswd "$vncpw" "$DIR/vncpass" >/dev/null 2>&1 || true
+    chmod 600 "$DIR/vncpass" 2>/dev/null || true
+  fi
+  echo "$vncpw" > "$DIR/vncpw.txt"; chmod 600 "$DIR/vncpw.txt"
   echo "$host" > "$DIR/hostname"
   log "Configured tunnel $host (VNC loopback:$VNC_PORT)"
 }
@@ -139,18 +164,25 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 
-  # x11vnc against the active graphical session, bound to loopback
+  # VNC server against the active graphical session, bound to loopback.
+  local vncexec
+  if [ "$SESSION_TYPE" = "wayland" ] && command -v wayvnc >/dev/null 2>&1; then
+    # wayvnc (wlroots) on loopback; security is the tunnel + operator DSUI auth.
+    vncexec="/usr/bin/wayvnc 127.0.0.1 $VNC_PORT"
+  else
+    vncexec="/usr/bin/x11vnc -rfbport $VNC_PORT -localhost -rfbauth $DIR/vncpass -forever -loop -shared -noxdamage -display :0 -auth guess"
+  fi
   cat > /etc/systemd/system/dsio-vnc.service <<UNIT
 [Unit]
 Description=DSIO Remote - VNC server (loopback)
-After=display-manager.service
+After=display-manager.service graphical.target
 [Service]
 Type=simple
-ExecStart=/usr/bin/x11vnc -rfbport $VNC_PORT -localhost -rfbauth $DIR/vncpass -forever -loop -shared -noxdamage -display :0 -auth guess
+ExecStart=$vncexec
 Restart=always
 RestartSec=5
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 UNIT
 
   systemctl daemon-reload
