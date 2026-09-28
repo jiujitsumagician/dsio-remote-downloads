@@ -18,6 +18,9 @@ DIR="/Library/Application Support/DsioRemote"
 BIN="/usr/local/bin/cloudflared"
 PLIST="/Library/LaunchDaemons/io.dsio.remote.tunnel.plist"
 LOG="/var/log/dsio-remote-agent.log"
+# The account the tunnel daemon runs as (see install_daemon). SUDO_USER when run the documented
+# way (sudo bash ...); falls back to the console user for the rare case it's run as root directly.
+RUN_USER="${SUDO_USER:-$(stat -f%Su /dev/console 2>/dev/null || echo root)}"
 
 log(){ echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG" >&2; }
 die(){ log "FATAL: $*"; exit 1; }
@@ -47,11 +50,21 @@ uninstall(){
 install_cloudflared(){
   if [ -x "$BIN" ]; then log "cloudflared present"; return; fi
   local arch tgt; case "$(uname -m)" in arm64) arch=arm64;; x86_64) arch=amd64;; *) die "arch $(uname -m)";; esac
+  # Pinned, not "latest": releases from late 2025 on use a newer Mach-O chained-fixups layout that
+  # dyld on Catalina/Big Sur can't parse (SIGSEGV in dyld itself before main() even runs). 2024.6.1
+  # is the newest build confirmed to load on 10.15 and still speaks the current tunnel protocol.
   log "Downloading cloudflared (darwin $arch)..."
   tgt="/tmp/cloudflared.tgz"
-  curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${arch}.tgz" -o "$tgt" || die "download failed"
+  curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/2024.6.1/cloudflared-darwin-${arch}.tgz" -o "$tgt" || die "download failed"
   tar -xzf "$tgt" -C /tmp cloudflared && mv /tmp/cloudflared "$BIN" && chmod +x "$BIN"
   rm -f "$tgt"
+  # Re-sign ad hoc. On at least one old Intel Mac the shipped signature made every *run* of the
+  # tunnel (not --version, which does nothing) get silently SIGKILLed a moment after it started
+  # doing real work, with taskgated logging "no signature for pid=N (cannot make code)" for a pid
+  # that had already been killed — the validation losing a race with an earlier kill, not causing
+  # it. Re-signing ad hoc reliably fixed it there; harmless to do unconditionally everywhere else.
+  codesign --remove-signature "$BIN" 2>/dev/null || true
+  codesign -s - --force "$BIN" 2>/dev/null || true
 }
 
 enable_screen_sharing(){
@@ -116,16 +129,25 @@ ingress:
   - service: http_status:404
 YML
   echo "$host" > "$DIR/hostname"
+  # The daemon (below) runs as this account, not root, so it can read its own credentials.
+  chown "$RUN_USER" "$DIR/$tid.json" "$DIR/config.yml" "$DIR/hostname" 2>/dev/null || true
   enable_screen_sharing "$vncpw"
   log "Configured $host"
 }
 
 install_daemon(){
+  # Run as the enrolling user, not root. cloudflared needs no privilege to dial out and forward
+  # to a loopback port, and on at least one old Mac the tunnel process was reliably SIGKILLed a
+  # moment into running when launchd ran it as root (see install_cloudflared for the fuller story;
+  # the ad-hoc re-sign there was the actual fix, but running unprivileged is also just correct).
+  rm -f /var/log/dsio-cloudflared.log
+  touch /var/log/dsio-cloudflared.log && chown "$RUN_USER" /var/log/dsio-cloudflared.log
   cat > "$PLIST" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>io.dsio.remote.tunnel</string>
+  <key>UserName</key><string>$RUN_USER</string>
   <key>ProgramArguments</key><array>
     <string>$BIN</string><string>tunnel</string><string>--config</string><string>$DIR/config.yml</string><string>run</string>
   </array>
